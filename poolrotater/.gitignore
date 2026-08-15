@@ -1,0 +1,89 @@
+# ============================================================
+# Secrets / OAuth / local configuration
+# ============================================================
+
+tokens.json
+**/tokens.json
+
+.env
+.env.*
+**/.env
+**/.env.*
+
+# If configs ever contain OAuth client secrets, keep real configs private.
+# Uncomment these if needed:
+# config.json
+# **/config.json
+
+
+# ============================================================
+# Databases
+# ============================================================
+
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+
+
+# ============================================================
+# Logs
+# ============================================================
+
+*.log
+logs/
+**/logs/
+
+
+# ============================================================
+# Large osu! datasets / dumps
+# ============================================================
+
+*.tar
+*.tar.gz
+*.tar.bz2
+*.bz2
+
+*.sql
+
+# Raw beatmap files
+*.osu
+*.osz
+
+# Large/local data directories, if present
+data/
+datasets/
+osu_files/
+
+
+# ============================================================
+# Farm finder generated output
+# ============================================================
+
+farm_maps*.csv
+farm_report*.csv
+
+# Add other generated CSVs here if you make them later.
+
+
+# ============================================================
+# Python
+# ============================================================
+
+__pycache__/
+*.py[cod]
+*.pyo
+
+.venv/
+venv/
+env/
+
+
+# ============================================================
+# Editor / OS
+# ============================================================
+
+.vscode/
+.DS_Store
+Thumbs.db
