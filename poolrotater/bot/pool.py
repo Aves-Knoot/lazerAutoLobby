@@ -115,59 +115,70 @@ class MapPool:
         self._recent: list[int] = []
         self.reload()
 
-    def _has_report(self, conn) -> bool:
+    def _has_table(self, conn, name: str) -> bool:
         return bool(conn.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='table' "
-            "AND name='farm_report'").fetchone())
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+            (name,),
+        ).fetchone())
+
+    def _has_report(self, conn) -> bool:
+        return self._has_table(conn, "farm_report")
 
     def reload(self) -> int:
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
 
-        if self._has_report(conn):
-            # farm_score is the analyzed result from osu-farm-finder.
-            # DT-dominant entries are excluded for this lobby pool, including
-            # combinations such as HDDT/DTHDHR.
-            rows = conn.execute("""
-                SELECT f.beatmap_id, f.artist, f.title, f.version, f.sr,
-                       f.hit_length, f.passcount, f.farm_score, f.quadrant,
-                       f.forgiveness, f.max_pp
-                FROM farm_report f
-                WHERE f.sr BETWEEN ? AND ?
-                  AND f.hit_length <= ?
-                  AND f.passcount >= ?
-                  AND COALESCE(f.dominant_mods, '') NOT LIKE '%DT%'
-                ORDER BY f.farm_score DESC
-                LIMIT ?
-            """, (self.sr_min, self.sr_max, self.max_length,
-                  self.min_passcount, self.limit)).fetchall()
-            source = "farm_report (DT excluded)"
-        else:
-            rows = []
-            source = "beatmaps"
+        try:
+            if self._has_report(conn):
+                # If farm_report exists, it is authoritative. An empty result
+                # means this particular SR/filter combination has no eligible
+                # farm-ranked maps; do NOT silently switch to raw popularity.
+                rows = conn.execute("""
+                    SELECT f.beatmap_id, f.artist, f.title, f.version, f.sr,
+                           f.hit_length, f.passcount, f.farm_score, f.quadrant,
+                           f.forgiveness, f.max_pp
+                    FROM farm_report f
+                    WHERE f.sr BETWEEN ? AND ?
+                      AND f.hit_length <= ?
+                      AND f.passcount >= ?
+                      AND COALESCE(f.dominant_mods, '') NOT LIKE '%DT%'
+                    ORDER BY f.farm_score DESC
+                    LIMIT ?
+                """, (self.sr_min, self.sr_max, self.max_length,
+                      self.min_passcount, self.limit)).fetchall()
+                source = "farm_report (DT excluded)"
 
-        if not rows:
-            # Fallback for a database that has not had ``report`` run yet.
-            # Raw beatmaps do not contain dominant_mods, so DT exclusion can
-            # only be guaranteed when farm_report exists.
-            rows = conn.execute("""
-                SELECT b.beatmap_id, b.artist, b.title, b.version, b.sr,
-                       b.hit_length, b.passcount,
-                       0.0 AS farm_score, '' AS quadrant,
-                       0.0 AS forgiveness, 0.0 AS max_pp
-                FROM beatmaps b
-                WHERE b.sr BETWEEN ? AND ?
-                  AND b.hit_length <= ?
-                  AND b.passcount >= ?
-                  AND b.status = 'ranked'
-                ORDER BY b.passcount DESC
-                LIMIT ?
-            """, (self.sr_min, self.sr_max, self.max_length,
-                  self.min_passcount, self.limit)).fetchall()
-            if source.startswith("farm_report"):
-                source = "beatmaps (report had no matching maps)"
+            elif self._has_table(conn, "beatmaps"):
+                # Compatibility fallback only for databases that genuinely do
+                # not have farm_report yet.
+                rows = conn.execute("""
+                    SELECT b.beatmap_id, b.artist, b.title, b.version, b.sr,
+                           b.hit_length, b.passcount,
+                           0.0 AS farm_score, '' AS quadrant,
+                           0.0 AS forgiveness, 0.0 AS max_pp
+                    FROM beatmaps b
+                    WHERE b.sr BETWEEN ? AND ?
+                      AND b.hit_length <= ?
+                      AND b.passcount >= ?
+                      AND b.status = 'ranked'
+                    ORDER BY b.passcount DESC
+                    LIMIT ?
+                """, (self.sr_min, self.sr_max, self.max_length,
+                      self.min_passcount, self.limit)).fetchall()
+                source = "beatmaps"
 
-        conn.close()
+            else:
+                # A report-only DB is valid for the lobby. If neither supported
+                # table exists, return an empty pool instead of throwing a raw
+                # SQLite exception from the middle of a live room.
+                rows = []
+                source = "database (no farm_report/beatmaps table)"
+                log.error(
+                    "farm database %s has neither farm_report nor beatmaps",
+                    self.db_path,
+                )
+        finally:
+            conn.close()
 
         self.maps = [
             PoolMap(
@@ -199,10 +210,46 @@ class MapPool:
         return len(self.maps)
 
     def set_range(self, sr_min: float, sr_max: float) -> int:
-        # Existing lazer playlist items are intentionally untouched. Only
-        # future selections come from the new range.
-        self.sr_min, self.sr_max = float(sr_min), float(sr_max)
-        return self.reload()
+        """Try a new SR range without destroying a known-good live pool.
+
+        Auto difficulty can legitimately ask for a range that contains no
+        farm_report maps. A live lobby must never crash or empty itself because
+        of that. If the candidate range cannot load at least one map, restore
+        the previous range and map list and return 0.
+        """
+        sr_min, sr_max = float(sr_min), float(sr_max)
+        if sr_min >= sr_max:
+            log.warning("rejected invalid SR range %.2f-%.2f", sr_min, sr_max)
+            return 0
+
+        old_min, old_max = self.sr_min, self.sr_max
+        old_maps = self.maps
+
+        self.sr_min, self.sr_max = sr_min, sr_max
+
+        try:
+            n = self.reload()
+        except sqlite3.Error as e:
+            self.sr_min, self.sr_max = old_min, old_max
+            self.maps = old_maps
+            log.error(
+                "could not load candidate range %.2f-%.2f*: %s; "
+                "keeping %.2f-%.2f*",
+                sr_min, sr_max, e, old_min, old_max,
+            )
+            return 0
+
+        if n <= 0:
+            self.sr_min, self.sr_max = old_min, old_max
+            self.maps = old_maps
+            log.warning(
+                "no eligible maps in candidate range %.2f-%.2f*; "
+                "keeping previous %.2f-%.2f* pool (%d maps)",
+                sr_min, sr_max, old_min, old_max, len(old_maps),
+            )
+            return 0
+
+        return n
 
     def next_map(self) -> PoolMap | None:
         """Pick a map while spacing out recently played beatmaps."""

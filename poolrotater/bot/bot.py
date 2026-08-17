@@ -78,6 +78,13 @@ class LobbyBot:
         # current map has concluded, before the queue is refilled.
         self._auto_retune_pending = False
 
+        # Room settings cannot be changed while a match/countdown is active.
+        # A manual .range issued during STARTING/PLAYING is still accepted for
+        # future map selection, but its title change is deferred until the
+        # next safe between-map window (SCORING/IDLE), before another
+        # countdown can begin.
+        self._pending_room_name_range: tuple[float, float] | None = None
+
         self.last_message_id = 0
         # Ids of messages WE posted. The bot runs as the operator's own
         # account, so sender_id cannot tell the two apart -- without this the
@@ -292,16 +299,34 @@ class LobbyBot:
                 try:
                     lo, hi = float(parts[1]), float(parts[2])
                     n = self.pool.set_range(lo, hi)
-                    self.update_room_name_for_range(lo, hi)
-                    self._auto_retune_pending = False
-                    # Lock it in until .auto is used again.
-                    self.manual_range = True
                     if n == 0:
-                        self.say(f"No maps in {lo:.1f}-{hi:.1f}* with the "
-                                 f"current length/passcount filters.")
+                        # MapPool restored the previous known-good range.
+                        self.say(
+                            f"No eligible maps in {lo:.1f}-{hi:.1f}*; "
+                            f"keeping {self.pool.sr_min:.1f}-"
+                            f"{self.pool.sr_max:.1f}*."
+                        )
                     else:
-                        self.say(f"Pool set to {lo:.1f}-{hi:.1f}* ({n} maps). "
-                                 f"Auto-difficulty off; {p}auto to re-enable.")
+                        self._auto_retune_pending = False
+                        # Lock it in until .auto is used again.
+                        self.manual_range = True
+
+                        renamed_now = self.update_room_name_for_range(
+                            self.pool.sr_min, self.pool.sr_max)
+
+                        if renamed_now:
+                            self.say(
+                                f"Pool set to {self.pool.sr_min:.1f}-"
+                                f"{self.pool.sr_max:.1f}* ({n} maps). "
+                                f"Auto-difficulty off; {p}auto to re-enable."
+                            )
+                        else:
+                            self.say(
+                                f"Pool set to {self.pool.sr_min:.1f}-"
+                                f"{self.pool.sr_max:.1f}* ({n} maps). "
+                                f"Room title will update between maps; "
+                                f"auto-difficulty off; {p}auto to re-enable."
+                            )
                 except ValueError:
                     self.say(f"Usage: {p}range 4.5 5.5")
             elif cmd == "auto":
@@ -309,6 +334,12 @@ class LobbyBot:
                 self.cfg["auto_difficulty"] = True
                 self.manual_range = False
                 self._auto_retune_pending = True
+
+                # If .range was issued during an active match and then .auto
+                # is requested before that match ends, the pending manual title
+                # is stale. The deferred auto calculation below becomes the
+                # authoritative desired range/title instead.
+                self._pending_room_name_range = None
 
                 # Explicit admin command while safely IDLE can apply now.
                 # During countdown/gameplay/scoring, defer until the map ends.
@@ -344,28 +375,68 @@ class LobbyBot:
 
         return f"{name.rstrip()} {label}".strip()
 
-    def update_room_name_for_range(self, lo: float | None = None,
-                                   hi: float | None = None) -> None:
-        """Keep the live room title synchronized with the active map pool."""
+    def update_room_name_for_range(
+            self, lo: float | None = None,
+            hi: float | None = None) -> bool:
+        """Synchronize the room title, deferring when room state is unsafe.
+
+        osu!'s referee server rejects ChangeRoomSettings while a match or
+        match-start countdown is active. Range changes are therefore allowed
+        immediately for future map selection, but title changes are queued
+        until SCORING/IDLE.
+
+        Returns True when the live title is already synchronized or was
+        changed now. Returns False when the update is deferred/retry-pending.
+        """
         if not self.room_id:
-            return
+            return False
 
         lo = self.pool.sr_min if lo is None else float(lo)
         hi = self.pool.sr_max if hi is None else float(hi)
         new_name = self._room_name_for_range(lo, hi)
 
         if new_name == self._current_room_name:
-            return
+            self._pending_room_name_range = None
+            return True
+
+        # Do not even ask the server in these states. Error 9 is expected if
+        # ChangeRoomSettings is attempted during gameplay/countdown.
+        if self.state in (STARTING, PLAYING):
+            self._pending_room_name_range = (lo, hi)
+            log.info(
+                "deferring room rename to %.2f-%.2f* until between maps "
+                "(state=%s)",
+                lo, hi, self.state,
+            )
+            return False
 
         try:
             self.hub.change_room_settings(self.room_id, name=new_name)
             self._current_room_name = new_name
+            self._pending_room_name_range = None
             log.info("room renamed for active range: %s", new_name)
+            return True
         except Exception as e:
-            # A title update is cosmetic. Never break the lobby because the
-            # referee API rejected or delayed a room-settings change.
-            log.warning("could not update room name for %.2f-%.2f*: %s",
-                        lo, hi, e)
+            # Keep the desired title queued. A transient hub race should not
+            # lose the requested name, and it must never crash the lobby.
+            self._pending_room_name_range = (lo, hi)
+            log.warning(
+                "could not update room name for %.2f-%.2f*: %s; "
+                "will retry at the next safe between-map boundary",
+                lo, hi, e,
+            )
+            return False
+
+    def apply_pending_room_name_update(self) -> bool:
+        """Apply a queued room title only during a safe between-map state."""
+        if self._pending_room_name_range is None:
+            return True
+
+        if self.state not in (SCORING, IDLE):
+            return False
+
+        lo, hi = self._pending_room_name_range
+        return self.update_room_name_for_range(lo, hi)
 
     def create_room(self) -> None:
         first = self.pool.next_map()
@@ -542,8 +613,13 @@ class LobbyBot:
         # maps come from the new range.
         self.apply_pending_auto_retune()
 
+        # A .range command may have arrived while the just-finished map (or its
+        # countdown) was active. The title change is only legal now, after
+        # gameplay has concluded and before the next countdown begins.
+        self.apply_pending_room_name_update()
+
         # Refill AFTER adopting the promoted item and applying any deferred
-        # auto range. One map leaves the front, one new map is appended.
+        # auto range/title. One map leaves the front, one new map is appended.
         self.fill_queue()
         self.starting_map = None
         self.starting_item_id = None
@@ -638,6 +714,11 @@ class LobbyBot:
         if actual < minimum:
             log.info("not starting: %d/%d gameplay players", actual, minimum)
             return
+
+        # Final room-settings gate before countdown. If an earlier active
+        # match forced a title update to be deferred, IDLE is the last safe
+        # point to apply it before StartMatch makes room settings illegal.
+        self.apply_pending_room_name_update()
 
         cd = self.cfg.get("countdown_seconds", 15)
         self._start_immediate_retry = False
@@ -812,14 +893,30 @@ class LobbyBot:
             return
 
         n = self.pool.set_range(lo, hi)
-        self.update_room_name_for_range(lo, hi)
+        if n <= 0:
+            # The requested range may simply have no farm_report maps. The
+            # pool object has already restored its previous known-good state.
+            # Keep this silent in lobby chat; a range shortage is an internal
+            # data condition, not something players need spammed with.
+            log.warning(
+                "auto retune %.2f-%.2f* (target %.2f*, median %.0fpp) "
+                "had no eligible maps; keeping %.2f-%.2f*",
+                lo, hi, target, med,
+                self.pool.sr_min, self.pool.sr_max,
+            )
+            return
+
+        self.update_room_name_for_range(
+            self.pool.sr_min, self.pool.sr_max)
         log.info(
             "auto retuned between maps to %.2f-%.2f* (target %.2f*) "
             "for median %.0fpp across %d player(s) (%d maps)",
-            lo, hi, target, med, len(pps), n,
+            self.pool.sr_min, self.pool.sr_max,
+            target, med, len(pps), n,
         )
         self.say(
-            f"Pool retuned to {lo:.2f}-{hi:.2f}* "
+            f"Pool retuned to {self.pool.sr_min:.2f}-"
+            f"{self.pool.sr_max:.2f}* "
             f"(target {target:.2f}*, median {med:.0f}pp, "
             f"{len(pps)} player{'s' if len(pps) != 1 else ''}, {n} maps)"
         )

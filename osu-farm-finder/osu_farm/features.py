@@ -213,11 +213,16 @@ SURROGATE_FEATURES_FULL = [
 
 def _score_frame(conn, post_rework_only=True, rework_date="2026-07-26") -> pd.DataFrame:
     q = """
-        SELECT s.beatmap_id, s.pp, s.accuracy, s.misses, s.max_combo, s.mods,
-               s.created_at, b.sr, b.ar, b.od, b.cs, b.hit_length, b.max_combo AS map_combo,
-               b.count_circles, b.count_sliders, b.passcount, b.playcount
-        FROM scores s JOIN beatmaps b USING(beatmap_id)
-        WHERE s.pp > 0 AND b.sr > 0 AND b.max_combo > 0
+        SELECT s.beatmap_id, s.user_id, s.position, s.pp, s.accuracy,
+               s.misses, s.max_combo, s.mods, s.created_at,
+               p.pp AS player_pp,
+               b.sr, b.ar, b.od, b.cs, b.hit_length,
+               b.max_combo AS map_combo, b.count_circles, b.count_sliders,
+               b.passcount, b.playcount
+        FROM scores s
+        JOIN beatmaps b USING(beatmap_id)
+        JOIN players p USING(user_id)
+        WHERE s.pp > 0 AND b.sr > 0 AND b.max_combo > 0 AND p.pp > 0
     """
     if post_rework_only:
         q += f" AND s.created_at >= '{rework_date}'"
@@ -229,6 +234,7 @@ def _score_frame(conn, post_rework_only=True, rework_date="2026-07-26") -> pd.Da
     df["combo_ratio"] = (df.max_combo / df.map_combo).clip(0, 1)
     df["log_length"] = np.log1p(df.hit_length.fillna(0))
     df["log_objects"] = np.log1p(df.count_circles.fillna(0) + df.count_sliders.fillna(0))
+    df["log_player_pp"] = np.log1p(df.player_pp.clip(lower=1.0))
     df["misses"] = df.misses.fillna(0)
     for m in ["HD", "HR", "DT", "FL", "EZ", "HT", "NF"]:
         df[f"m_{m}"] = df.mods.fillna("NM").str.contains(m).astype(int)
@@ -283,7 +289,7 @@ def fit_pp_surrogate(db_path: str, post_rework_only=True, min_scores=2000):
     return model, df
 
 
-def map_pp_efficiency(model, df: pd.DataFrame, min_scores=8,
+def map_pp_efficiency(model, df: pd.DataFrame, min_scores=5,
                       features=None) -> pd.DataFrame:
     """Per-map pp efficiency: how much more pp a map pays than its stats predict.
 
@@ -340,9 +346,131 @@ def map_pp_efficiency(model, df: pd.DataFrame, min_scores=8,
     return g.sort_values("pp_efficiency_shrunk", ascending=False)
 
 
+
+# ----------------------------------------- 3. realized player-skill efficiency
+
+# This model deliberately does NOT include accuracy, misses, or combo.  It asks
+# a different question from SURROGATE_FEATURES above:
+#
+#   "For a player of this overall skill, on a map of this SR/mod/length,
+#    how much pp does a top-100 play normally pay?"
+#
+# A positive map residual therefore captures realized return: similar-skilled
+# players are extracting more pp from this map than they normally do from maps
+# with comparable headline difficulty and time commitment.  That signal rolls
+# together practical ease and payout without using map popularity as a reward.
+REALIZED_FEATURES = [
+    "log_player_pp", "sr", "log_length",
+    "m_HD", "m_HR", "m_DT", "m_FL", "m_EZ", "m_HT", "m_NF",
+]
+
+
+def fit_realized_pp_surrogate(db_path: str, post_rework_only=True,
+                              min_scores=2000):
+    """Learn realized pp from player skill + map difficulty/time + mods.
+
+    Unlike ``fit_pp_surrogate``, this model intentionally leaves score quality
+    (accuracy, misses and combo) OUT.  Its residual is a practical farm signal:
+    players of comparable skill are getting unusually large pp returns on a
+    particular map for its SR, mod bucket and length.
+    """
+    from sklearn.ensemble import HistGradientBoostingRegressor
+    from sklearn.model_selection import train_test_split
+
+    conn = connect(db_path)
+    df = _score_frame(conn, post_rework_only)
+    conn.close()
+
+    if len(df) < min_scores:
+        if post_rework_only:
+            warnings.warn(
+                f"Only {len(df)} post-rework scores for realized-efficiency "
+                "fit. Falling back to all scores."
+            )
+            return fit_realized_pp_surrogate(
+                db_path, post_rework_only=False, min_scores=min_scores)
+        raise SystemExit(f"Not enough scores to fit ({len(df)}). Collect more.")
+
+    X = df[REALIZED_FEATURES].values
+    y = np.log(df.pp.values)
+    Xtr, Xte, ytr, yte = train_test_split(
+        X, y, test_size=0.2, random_state=17)
+    model = HistGradientBoostingRegressor(
+        max_iter=350, learning_rate=0.06, max_depth=6, random_state=17)
+    model.fit(Xtr, ytr)
+    r2 = model.score(Xte, yte)
+    resid_sd = float(np.std(yte - model.predict(Xte)))
+    print(f"  realized fit on {len(df):,} scores | test R2={r2:.4f} "
+          f"| residual sd={resid_sd:.4f} (log pp)")
+    return model, df
+
+
+def _empirical_bayes_shrink(mean: pd.Series, sd: pd.Series,
+                            n: pd.Series) -> tuple[pd.Series, pd.Series]:
+    """Shrink noisy map means toward zero and return (mean, shrink_factor)."""
+    prior_var = float(mean.var())
+    if not np.isfinite(prior_var) or prior_var <= 1e-9:
+        prior_var = 1e-6
+
+    finite_sd = sd.replace([np.inf, -np.inf], np.nan)
+    typical_sd = float(finite_sd.dropna().median()) if finite_sd.notna().any() else 0.1
+    if not np.isfinite(typical_sd) or typical_sd <= 1e-6:
+        typical_sd = 0.1
+    filled_sd = finite_sd.fillna(typical_sd).clip(lower=1e-6)
+
+    obs_var = (filled_sd ** 2) / n.clip(lower=1)
+    factor = prior_var / (prior_var + obs_var)
+    return mean * factor, factor
+
+
+def map_realized_efficiency(model, df: pd.DataFrame, min_scores=5,
+                            features=None) -> pd.DataFrame:
+    """Per-map practical pp return for comparable player skill and time.
+
+    Positive means sampled players earn more pp on this map than the realized
+    model expects from their overall pp, the map's SR, its drain time and mods.
+    Sample size affects the empirical-Bayes shrinkage and the reported
+    confidence, but it is NOT itself a farm-score bonus.
+    """
+    feats = features or REALIZED_FEATURES
+    pred = model.predict(df[feats].values)
+    d = df.assign(realized_resid=np.log(df.pp.values) - pred)
+
+    g = d.groupby("beatmap_id").agg(
+        realized_efficiency=("realized_resid", "mean"),
+        realized_efficiency_sd=("realized_resid", "std"),
+        realized_n_scores=("realized_resid", "size"),
+    ).reset_index()
+    g = g[g.realized_n_scores >= min_scores].copy()
+    if g.empty:
+        return g
+
+    shrunk, factor = _empirical_bayes_shrink(
+        g.realized_efficiency,
+        g.realized_efficiency_sd,
+        g.realized_n_scores,
+    )
+    g["realized_efficiency_shrunk"] = shrunk
+    g["realized_shrink_factor"] = factor
+
+    if "mod_bucket" in d.columns:
+        mod_of = d.groupby("beatmap_id").mod_bucket.agg(
+            lambda x: x.mode().iat[0] if len(x.mode()) else "NM")
+        g["realized_mod_bucket"] = g.beatmap_id.map(mod_of).fillna("NM")
+        offsets = g.groupby("realized_mod_bucket").realized_efficiency_shrunk.transform("mean")
+        g["realized_mod_offset"] = offsets
+        g["realized_efficiency_shrunk"] = g.realized_efficiency_shrunk - offsets
+
+    spread = float(g.realized_efficiency_shrunk.std())
+    print(f"  realized-efficiency spread: sd={spread:.4f} "
+          f"(range {g.realized_efficiency_shrunk.min():+.3f} to "
+          f"{g.realized_efficiency_shrunk.max():+.3f})")
+    return g.sort_values("realized_efficiency_shrunk", ascending=False)
+
+
 # --------------------------------------------------- 3. achievability
 
-def map_achievability(df: pd.DataFrame, min_scores=8) -> pd.DataFrame:
+def map_achievability(df: pd.DataFrame, min_scores=5) -> pd.DataFrame:
     """How demanding is a map, conditional on it appearing in a top 100?
 
     pp_efficiency asks "does this map overpay for a given performance?".

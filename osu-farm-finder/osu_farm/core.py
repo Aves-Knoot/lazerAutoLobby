@@ -71,6 +71,15 @@ CREATE TABLE IF NOT EXISTS scores (
 CREATE INDEX IF NOT EXISTS ix_scores_map  ON scores(beatmap_id);
 CREATE INDEX IF NOT EXISTS ix_scores_user ON scores(user_id);
 
+-- Tracks when a player's COMPLETE current top-100 was last refreshed.
+-- Do not infer score freshness from players.fetched_at: ranking collection
+-- updates that timestamp independently of score collection.
+CREATE TABLE IF NOT EXISTS score_fetches (
+    user_id      INTEGER PRIMARY KEY,
+    fetched_at   REAL NOT NULL,
+    score_count  INTEGER NOT NULL DEFAULT 0
+);
+
 CREATE TABLE IF NOT EXISTS beatmaps (
     beatmap_id     INTEGER PRIMARY KEY,
     beatmapset_id  INTEGER,

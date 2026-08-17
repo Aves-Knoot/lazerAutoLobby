@@ -34,6 +34,11 @@ def main() -> int:
                    help="use global rankings only (caps at top 10,000 players)")
     c.add_argument("--pp-floor", type=float, default=1000.0,
                    help="stop sampling a country below this pp")
+    c.add_argument("--stage", choices=["all", "players", "scores", "beatmaps"],
+                   default="all",
+                   help="run one collection stage or the full pipeline")
+    c.add_argument("--score-refresh-days", type=int, default=14,
+                   help="skip top-100 snapshots refreshed within this many days")
 
     sub.add_parser("coverage", help="show players and scores per pp bracket")
 
@@ -42,7 +47,10 @@ def main() -> int:
     m.add_argument("--dir", default="maps")
 
     r = sub.add_parser("report", help="run models and write the farm table")
-    r.add_argument("--top", type=int, default=200)
+    r.add_argument("--top", type=int, default=200,
+                   help="number of highest-ranked maps to save (ignored with --all)")
+    r.add_argument("--all", action="store_true",
+                   help="save every qualifying map to farm_report instead of truncating to --top")
     r.add_argument("--out", default="farm_maps.csv")
     r.add_argument("--post-rework", action="store_true",
                    help="only use scores set after the July 2026 rework")
@@ -52,8 +60,22 @@ def main() -> int:
     r.add_argument("--sr-max", type=float, default=None, help="maximum star rating")
     r.add_argument("--max-length", type=int, default=None,
                    help="maximum drain time in seconds")
+    r.add_argument("--min-passcount", type=int, default=None,
+                   help="minimum public passcount")
     r.add_argument("--mods", default=None,
-                   help="only show this mod bucket, e.g. NM or DT")
+                   help="only show this exact dominant mod bucket, e.g. NM")
+    r.add_argument("--exclude-dt", action="store_true",
+                   help="exclude any dominant mod bucket containing DT")
+    r.add_argument("--formula-weight", type=float, default=0.65,
+                   help="Farm Score v2.1 formula-efficiency weight (default 0.65)")
+    r.add_argument("--disagreement-penalty", type=float, default=0.30,
+                   help="penalty strength for formula-positive/realized-negative disagreement (default 0.30)")
+    r.add_argument("--no-sr-calibration", action="store_true",
+                   help="disable SR-local Farm Score calibration")
+    r.add_argument("--sr-calibration-bandwidth", type=float, default=1.25,
+                   help="SR smoothing bandwidth in stars (default 1.25)")
+    r.add_argument("--sr-calibration-prior-maps", type=float, default=300.0,
+                   help="maps of prior support used to shrink sparse-tail calibration (default 300)")
 
     args = ap.parse_args()
     cfg = Config(db_path=args.db)
@@ -65,9 +87,32 @@ def main() -> int:
             cfg.requests_per_minute = args.rpm
         print(f"  rate: {cfg.requests_per_minute} req/min, "
               f"concurrency {cfg.concurrency}")
-        from osu_farm.collect import run_all
-        asyncio.run(run_all(cfg, pages=args.pages, player_limit=args.players,
-                            deep=not args.global_only, pp_floor=args.pp_floor))
+        from osu_farm.collect import (
+            collect_beatmaps, collect_players, collect_players_deep,
+            collect_scores, coverage,
+        )
+
+        async def _collect_selected_stages():
+            if args.stage in ("all", "players"):
+                print("[players]")
+                if args.global_only:
+                    await collect_players(cfg, pages=args.pages)
+                else:
+                    await collect_players_deep(cfg, pp_floor=args.pp_floor)
+
+            if args.stage in ("all", "scores"):
+                print("[current top-100 scores]")
+                await collect_scores(
+                    cfg, limit=args.players, refresh_days=args.score_refresh_days
+                )
+
+            if args.stage in ("all", "beatmaps"):
+                print("[beatmap metadata]")
+                await collect_beatmaps(cfg)
+
+        asyncio.run(_collect_selected_stages())
+        print("\ncoverage:")
+        coverage(cfg.db_path)
 
     elif args.cmd == "coverage":
         from osu_farm.collect import coverage
@@ -90,31 +135,47 @@ def main() -> int:
 
     elif args.cmd == "report":
         from osu_farm.analyze import farm_report
-        df = farm_report(cfg.db_path, top_n=args.top,
-                         post_rework_only=args.post_rework,
-                         min_observations=args.min_obs)
-        cols = ["beatmap_id", "artist", "title", "version", "dominant_mods",
-                "sr", "bracket", "farm_score", "quadrant",
-                "pp_efficiency_shrunk", "overrep", "forgiveness",
-                "median_acc", "pct_miss_free", "median_combo_ratio",
-                "hit_length", "cs", "od", "mean_pp", "p90_pp", "max_pp",
-                "raw_count", "passcount", "url"]
-        if args.sr_min is not None:
-            df = df[df.sr >= args.sr_min]
-        if args.sr_max is not None:
-            df = df[df.sr <= args.sr_max]
-        if args.max_length is not None:
-            df = df[df.hit_length <= args.max_length]
-        if args.mods:
-            df = df[df.dominant_mods == args.mods]
+        df = farm_report(
+            cfg.db_path,
+            top_n=None if args.all else args.top,
+            post_rework_only=args.post_rework,
+            min_observations=args.min_obs,
+            sr_min=args.sr_min,
+            sr_max=args.sr_max,
+            max_length=args.max_length,
+            min_passcount=args.min_passcount,
+            mods=args.mods,
+            exclude_dt=args.exclude_dt,
+            formula_weight=args.formula_weight,
+            disagreement_weight=args.disagreement_penalty,
+            sr_calibration=not args.no_sr_calibration,
+            sr_calibration_bandwidth=args.sr_calibration_bandwidth,
+            sr_calibration_prior_maps=args.sr_calibration_prior_maps,
+        )
+        cols = [
+            "beatmap_id", "artist", "title", "version", "dominant_mods",
+            "sr", "farm_score", "precalibration_farm_score",
+            "base_farm_score", "sr_local_baseline_raw",
+            "sr_calibration_strength", "sr_calibration_adjustment",
+            "confidence",
+            "confidence_label", "efficiency_agreement",
+            "efficiency_disagreement", "disagreement_penalty",
+            "pp_efficiency_shrunk", "realized_efficiency_shrunk",
+            "overrep", "profile_impact", "median_position",
+            "top10_count", "top20_count", "top30_count",
+            "forgiveness", "median_acc", "pct_miss_free",
+            "median_combo_ratio", "hit_length", "cs", "od", "mean_pp",
+            "p90_pp", "max_pp", "raw_count", "passcount", "url",
+        ]
         cols = [c for c in cols if c in df.columns]
         df[cols].to_csv(args.out, index=False)
         print(f"\nwrote {args.out}")
         from osu_farm.analyze import save_report
         n = save_report(cfg.db_path, df)
         print(f"wrote {n} maps to the farm_report table in {cfg.db_path}")
-        with __import__("pandas").option_context("display.width", 200,
-                                                 "display.max_columns", 30):
+        with __import__("pandas").option_context(
+            "display.width", 220, "display.max_columns", 35
+        ):
             print(df[cols].head(25).to_string(index=False))
     return 0
 
