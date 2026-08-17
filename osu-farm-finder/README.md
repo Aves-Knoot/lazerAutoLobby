@@ -46,10 +46,9 @@ Every stage is resumable. Re-running `collect` skips players fetched in the last
 
 ## Rate limiting
 
-Defaults to 300 requests/minute against a documented ceiling of ~1200. Handles
+Defaults to 60 requests/minute against a documented ceiling of 60. Handles
 429 with `Retry-After`, retries 5xx with backoff, and refreshes the OAuth token
-automatically. Raise with `--rpm` if you're impatient, but the ceiling is a
-courtesy limit, not a target.
+automatically. Raise with `--rpm` if you're impatient, but the ceiling is a limit set by the devs who *will* remove your oauth key if you abuse it
 
 ## The rework problem, and how this works around it
 
